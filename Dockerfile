@@ -1,8 +1,8 @@
-FROM golang:1.21
+FROM golang:1.22-alpine3.19 AS builder
 WORKDIR /go/src/app
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o vault-init -v .
+RUN CGO_ENABLED=0 go build -o vault-init .
 
-FROM scratch
-COPY --from=0 /go/src/app/vault-init /
-ENTRYPOINT ["/vault-init"]
+FROM alpine:3.19
+COPY --from=builder /go/src/app/vault-init /usr/local/bin
+ENTRYPOINT ["vault-init"]

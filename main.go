@@ -5,335 +5,259 @@
 package main
 
 import (
-	"bytes"
-	"crypto/tls"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"log/slog"
 	"os"
-	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/kms"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/hashicorp/vault/api"
+	"github.com/pkg/errors"
+	"github.com/spf13/viper"
 )
 
 var (
-	vaultAddr     string
-	checkInterval string
-	s3BucketName  string
-	httpClient    http.Client
-	kmsKeyId      string
+	secretsManagerSecretID string
+	client                 *api.Client
 )
 
-// InitRequest holds a Vault init request.
-type InitRequest struct {
-	SecretShares    int `json:"secret_shares"`
-	SecretThreshold int `json:"secret_threshold"`
-}
+func init() {
+	viper.AutomaticEnv()
 
-// InitResponse holds a Vault init response.
-type InitResponse struct {
-	Keys       []string `json:"keys"`
-	KeysBase64 []string `json:"keys_base64"`
-	RootToken  string   `json:"root_token"`
-}
+	viper.SetDefault("check_interval", 10*time.Second)
+	viper.SetDefault("vault_secret_shares", 5)
+	viper.SetDefault("vault_secret_threshold", 3)
+	viper.SetDefault("log_level", slog.LevelInfo)
 
-// UnsealRequest holds a Vault unseal request.
-type UnsealRequest struct {
-	Key   string `json:"key"`
-	Reset bool   `json:"reset"`
-}
-
-// UnsealResponse holds a Vault unseal response.
-type UnsealResponse struct {
-	Sealed   bool `json:"sealed"`
-	T        int  `json:"t"`
-	N        int  `json:"n"`
-	Progress int  `json:"progress"`
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.Level(viper.GetInt("log_level")),
+	})))
 }
 
 func main() {
-	log.Println("Starting the vault-init service...")
+	slog.Info("Starting up...")
 
-	vaultAddr = os.Getenv("VAULT_ADDR")
-	if vaultAddr == "" {
-		vaultAddr = "https://127.0.0.1:8200"
+	secretsManagerSecretID = viper.GetString("secretsmanager_secret_id")
+	if secretsManagerSecretID == "" {
+		log.Fatal("SECRETSMANAGER_SECRET_ID env is required")
 	}
 
-	checkInterval = os.Getenv("CHECK_INTERVAL")
-	if checkInterval == "" {
-		checkInterval = "10"
-	}
+	ctx := context.Background()
 
-	i, err := strconv.Atoi(checkInterval)
+	checkIAMPermissionsForSecret(ctx)
+
+	var err error
+	client, err = newVaultAPIClient()
 	if err != nil {
-		log.Fatalf("CHECK_INTERVAL is invalid: %s", err)
+		log.Fatalf("Create vault API client: %v", err)
 	}
 
-	checkIntervalDuration := time.Duration(i) * time.Second
+	ticker := time.NewTicker(viper.GetDuration("check_interval"))
 
-	s3BucketName = os.Getenv("S3_BUCKET_NAME")
-	if s3BucketName == "" {
-		log.Fatal("S3_BUCKET_NAME must be set and not empty")
-	}
-
-	kmsKeyId = os.Getenv("KMS_KEY_ID")
-	if kmsKeyId == "" {
-		log.Fatal("KMS_KEY_ID must be set and not empty")
-	}
-
-	timeout := time.Duration(2 * time.Second)
-
-	httpClient = http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
+	if err := checkVaultStatus(ctx); err != nil {
+		slog.Error("Checking vault for the first time", "error", err)
 	}
 
 	for {
-		response, err := httpClient.Get(vaultAddr + "/v1/sys/health")
-		if response != nil && response.Body != nil {
-			response.Body.Close()
+		slog.Debug("Tick", "time", <-ticker.C)
+		if err := checkVaultStatus(ctx); err != nil {
+			slog.Error("Checking vault", "error", err)
 		}
+	}
+}
 
-		if err != nil {
-			log.Println(err)
-			time.Sleep(checkIntervalDuration)
-			continue
-		}
+func checkIAMPermissionsForSecret(ctx context.Context) {
+	var (
+		sm           = secretsmanager.New(session.Must(session.NewSession()))
+		secretString = fmt.Sprintf("%d", time.Now().UnixNano())
+	)
 
-		switch response.StatusCode {
-		case 200:
-			log.Println("Vault is initialized and unsealed.")
-		case 429:
-			log.Println("Vault is unsealed and in standby mode.")
-		case 501:
-			log.Println("Vault is not initialized. Initializing and unsealing...")
-			initialize()
-			unseal()
-		case 503:
-			log.Println("Vault is sealed. Unsealing...")
-			unseal()
+	_, err := sm.UpdateSecretWithContext(ctx, &secretsmanager.UpdateSecretInput{
+		SecretId:     &secretsManagerSecretID,
+		SecretString: &secretString,
+	})
+	if err != nil {
+		log.Fatalf("Update secret with id %q: %v", secretsManagerSecretID, err)
+	}
+
+	_, err = sm.GetSecretValueWithContext(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: &secretsManagerSecretID,
+	})
+	if err != nil {
+		log.Fatalf("Get secret with id %q: %v", secretsManagerSecretID, err)
+	}
+}
+
+func newVaultAPIClient() (*api.Client, error) {
+	config := api.DefaultConfig()
+
+	if err := config.ReadEnvironment(); err != nil {
+		return nil, errors.Wrap(err, "failed to read environment")
+	}
+
+	client, err := api.NewClient(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create client")
+	}
+
+	return client, nil
+}
+
+func checkVaultStatus(ctx context.Context) error {
+	slog.Debug("Checking vault status")
+
+	healthResponse, err := client.Sys().Health()
+	if err != nil {
+		return errors.Wrap(err, "read health")
+	}
+
+	slog.Debug("Got vault status", "data", healthResponse)
+
+	if healthResponse.Initialized && !healthResponse.Sealed {
+		slog.Debug("Nothing to do")
+		return nil
+	}
+
+	sm := secretsmanager.New(session.Must(session.NewSession()))
+
+	if !healthResponse.Initialized {
+		var (
+			hostname = os.Getenv("HOSTNAME")
+			replica  = int(hostname[len(hostname)-1]) - 48
+		)
+
+		slog.Debug("Vault replica", "n", replica)
+
+		switch replica {
+		case 0:
+			err = initialize(ctx, sm)
+			if err != nil {
+				return errors.Wrap(err, "initialize")
+			}
+
 		default:
-			log.Printf("Vault is in an unknown state. Status code: %d", response.StatusCode)
+			err = joinRaftCluster(ctx)
+			if err != nil {
+				return errors.Wrap(err, "raft join")
+			}
 		}
-
-		log.Printf("Next check in %s", checkIntervalDuration)
-		time.Sleep(checkIntervalDuration)
-	}
-}
-
-func initialize() {
-	initRequest := InitRequest{
-		SecretShares:    5,
-		SecretThreshold: 3,
 	}
 
-	initRequestData, err := json.Marshal(&initRequest)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	r := bytes.NewReader(initRequestData)
-
-	request, err := http.NewRequest("PUT", vaultAddr+"/v1/sys/init", r)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	response, err := httpClient.Do(request)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	initRequestResponseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	if response.StatusCode != 200 {
-		log.Printf("init: non 200 status code: %d", response.StatusCode)
-		return
-	}
-
-	var initResponse InitResponse
-
-	if err := json.Unmarshal(initRequestResponseBody, &initResponse); err != nil {
-		log.Println(err)
-		return
-	}
-
-	log.Println("Encrypting unseal keys and the root token and uploading to bucket...")
-
-	AWSSession, err := session.NewSession()
-	if err != nil {
-		log.Println("Error creating session: ", err)
-	}
-
-	KMSService := kms.New(AWSSession)
-	S3Service := s3.New(AWSSession)
-
-	// Encrypt root token.
-	rootTokenEncryptedData, err := KMSService.Encrypt(&kms.EncryptInput{
-		KeyId:     aws.String(kmsKeyId),
-		Plaintext: []byte(initResponse.RootToken),
-	})
-	if err != nil {
-		log.Println("Error encrypting root token: ", err)
-	}
-
-	// Encrypt unseal keys.
-	unsealKeysEncryptedData, err := KMSService.Encrypt(&kms.EncryptInput{
-		KeyId:     aws.String(kmsKeyId),
-		Plaintext: []byte(base64.StdEncoding.EncodeToString(initRequestResponseBody)),
-	})
-	if err != nil {
-		log.Println("Error encrypting unseal keys: ", err)
-	}
-
-	// Save the encrypted root token.
-	rootTokenPutRequest := &s3.PutObjectInput{
-		Body:   bytes.NewReader(rootTokenEncryptedData.CiphertextBlob),
-		Bucket: aws.String(s3BucketName),
-		Key:    aws.String("root-token.json.enc"),
-	}
-
-	_, err = S3Service.PutObject(rootTokenPutRequest)
-	if err != nil {
-		log.Printf("Cannot write root token to bucket s3://%s/%s: %s", s3BucketName, "root-token.json.enc", err)
-	} else {
-		log.Printf("Root token written to s3://%s/%s", s3BucketName, "root-token.json.enc")
-	}
-
-	// Save the encrypted unseal keys.
-	unsealKeysEncryptRequest := &s3.PutObjectInput{
-		Body:   bytes.NewReader(unsealKeysEncryptedData.CiphertextBlob),
-		Bucket: aws.String(s3BucketName),
-		Key:    aws.String("unseal-keys.json.enc"),
-	}
-
-	_, err = S3Service.PutObject(unsealKeysEncryptRequest)
-	if err != nil {
-		log.Printf("Cannot write unseal keys to bucket s3://%s/%s: %s", s3BucketName, "unseal-keys.json.enc", err)
-	} else {
-		log.Printf("Unseal keys written to s3://%s/%s", s3BucketName, "unseal-keys.json.enc")
-	}
-
-	log.Println("Initialization complete.")
-}
-
-func unseal() {
-
-	AWSSession, err := session.NewSession()
-	if err != nil {
-		log.Println("Error creating session: ", err)
-	}
-
-	KMSService := kms.New(AWSSession)
-	S3Service := s3.New(AWSSession)
-
-	unsealKeysRequest := &s3.GetObjectInput{
-		Bucket: aws.String(s3BucketName),
-		Key:    aws.String("unseal-keys.json.enc"),
-	}
-
-	unsealKeysEncryptedObject, err := S3Service.GetObject(unsealKeysRequest)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	unsealKeysEncryptedObjectData, err := io.ReadAll(unsealKeysEncryptedObject.Body)
-	if err != nil {
-		log.Println(err)
-	}
-
-	unsealKeysData, err := KMSService.Decrypt(&kms.DecryptInput{
-		CiphertextBlob: unsealKeysEncryptedObjectData,
-	})
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	var initResponse InitResponse
-
-	unsealKeysPlaintext, err := base64.StdEncoding.DecodeString(string(unsealKeysData.Plaintext))
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	if err := json.Unmarshal(unsealKeysPlaintext, &initResponse); err != nil {
-		log.Println(err)
-		return
-	}
-
-	for _, key := range initResponse.KeysBase64 {
-		done, err := unsealOne(key)
-		if done {
-			return
-		}
-
+	if healthResponse.Sealed {
+		err = unseal(ctx, sm)
 		if err != nil {
-			log.Println(err)
-			return
+			return errors.Wrap(err, "unseal")
 		}
 	}
+
+	return nil
 }
 
-func unsealOne(key string) (bool, error) {
-	unsealRequest := UnsealRequest{
-		Key: key,
-	}
+func initialize(ctx context.Context, sm *secretsmanager.SecretsManager) error {
+	slog.Info("Initializing vault server...")
 
-	unsealRequestData, err := json.Marshal(&unsealRequest)
+	initResponse, err := client.Sys().InitWithContext(ctx, &api.InitRequest{
+		SecretShares:    viper.GetInt("vault_secret_shares"),
+		SecretThreshold: viper.GetInt("vault_secret_threshold"),
+	})
 	if err != nil {
-		return false, err
+		return errors.Wrap(err, "init vault")
 	}
 
-	r := bytes.NewReader(unsealRequestData)
-	request, err := http.NewRequest(http.MethodPut, vaultAddr+"/v1/sys/unseal", r)
+	slog.Info("Vault server initialized successfully, uploading result to AWS...", "secretID", secretsManagerSecretID)
+
+	data, err := json.Marshal(&initResponse)
 	if err != nil {
-		return false, err
+		panic("couldn't marshal init response:" + err.Error())
 	}
 
-	response, err := httpClient.Do(request)
+	secretString := string(data)
+
+	for {
+		output, err := sm.UpdateSecretWithContext(ctx, &secretsmanager.UpdateSecretInput{
+			SecretId:     &secretsManagerSecretID,
+			SecretString: &secretString,
+		})
+		if err == nil {
+			slog.Info("Updated secret", "arn", *output.ARN, "version", *output.VersionId)
+			break
+		}
+		slog.Error("Cannot update secret", "error", err)
+		time.Sleep(3 * time.Second)
+	}
+
+	slog.Info("Initialization process completed")
+	return nil
+}
+
+func joinRaftCluster(ctx context.Context) error {
+	slog.Info("Joining RAFT cluster...")
+
+	opts := api.RaftJoinRequest{
+		LeaderAPIAddr:    viper.GetString("raft_leader_api_addr"),
+		LeaderCACert:     parseEnvFile(viper.GetString("raft_leader_ca_cert")),
+		LeaderClientCert: parseEnvFile(viper.GetString("raft_leader_client_cert")),
+		LeaderClientKey:  parseEnvFile(viper.GetString("raft_leader_client_key")),
+	}
+
+	res, err := client.Sys().RaftJoinWithContext(ctx, &opts)
 	if err != nil {
-		return false, err
+		return err
 	}
-	defer response.Body.Close()
-
-	if response.StatusCode != 200 {
-		return false, fmt.Errorf("unseal: non-200 status code: %d", response.StatusCode)
+	if !res.Joined {
+		return errors.Errorf("couldn't join with opts: %#v", opts)
 	}
 
-	unsealRequestResponseBody, err := io.ReadAll(response.Body)
+	slog.Info("Joined RAFT cluster successfully")
+	return nil
+}
+
+func unseal(ctx context.Context, sm *secretsmanager.SecretsManager) error {
+	slog.Info("Fetching unseal keys...", "secretID", secretsManagerSecretID)
+
+	secret, err := sm.GetSecretValueWithContext(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: &secretsManagerSecretID,
+	})
 	if err != nil {
-		return false, err
+		return errors.Wrap(err, "get AWS secret")
 	}
 
-	var unsealResponse UnsealResponse
-	if err := json.Unmarshal(unsealRequestResponseBody, &unsealResponse); err != nil {
-		return false, err
+	var initResponse api.InitResponse
+
+	err = json.Unmarshal([]byte(*secret.SecretString), &initResponse)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal")
 	}
 
-	if !unsealResponse.Sealed {
-		return true, nil
+	slog.Info("Unseal keys received, unsealing vault server...")
+
+	for i, key := range initResponse.KeysB64 {
+		status, err := client.Sys().UnsealWithContext(ctx, key)
+		if err != nil {
+			return errors.Wrapf(err, "unseal shard %d", i)
+		}
+		slog.Info("Unseal", "progress", status.Progress)
+		if status.Progress <= 0 {
+			break
+		}
 	}
 
-	return false, nil
+	slog.Info("Vault server unsealed successfully")
+	return nil
+}
+
+func parseEnvFile(raw string) string {
+	if len(raw) == 0 || raw[0] != '@' {
+		return raw
+	}
+
+	contents, err := os.ReadFile(raw[1:])
+	if err != nil {
+		panic(err)
+	}
+	return string(contents)
 }
