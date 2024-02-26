@@ -10,7 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -87,9 +87,9 @@ func main() {
 	if kmsKeyId == "" {
 		log.Fatal("KMS_KEY_ID must be set and not empty")
 	}
-	
+
 	timeout := time.Duration(2 * time.Second)
-	
+
 	httpClient = http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -158,7 +158,7 @@ func initialize() {
 		return
 	}
 
-	initRequestResponseBody, err := ioutil.ReadAll(response.Body)
+	initRequestResponseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		log.Println(err)
 		return
@@ -256,7 +256,7 @@ func unseal() {
 		return
 	}
 
-	unsealKeysEncryptedObjectData, err := ioutil.ReadAll(unsealKeysEncryptedObject.Body)
+	unsealKeysEncryptedObjectData, err := io.ReadAll(unsealKeysEncryptedObject.Body)
 	if err != nil {
 		log.Println(err)
 	}
@@ -321,7 +321,7 @@ func unsealOne(key string) (bool, error) {
 		return false, fmt.Errorf("unseal: non-200 status code: %d", response.StatusCode)
 	}
 
-	unsealRequestResponseBody, err := ioutil.ReadAll(response.Body)
+	unsealRequestResponseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		return false, err
 	}
