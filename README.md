@@ -1,6 +1,7 @@
-# vault-init
+# vault-init-aws-raft
 
-This is a port of [Kelsey Hightower](https://github.com/kelseyhightower) [vault-init](https://github.com/kelseyhightower/vault-init) to AWS.
+This is a modified version of [vault-init-aws](https://github.com/caquino/vault-init-aws/) to store the Vault secret configuration in an AWS Secrets Manager secret.
+The project has also been moderized to use Go modules and [aws-sdk-go-v2](https://aws.github.io/aws-sdk-go-v2/docs/) and support Vault running in [Raft mode](https://developer.hashicorp.com/vault/docs/configuration/storage/raft).
 
 The `vault-init` service automates the process of [initializing](https://www.vaultproject.io/docs/commands/operator/init.html) and [unsealing](https://www.vaultproject.io/docs/concepts/seal.html#unsealing) HashiCorp Vault instances running on [Amazon Web Services](http://aws.amazon.com/).
 
@@ -10,128 +11,26 @@ After `vault-init` initializes a Vault server it stores master keys and root tok
 
 The `vault-init` service is designed to be run alongside a Vault server and communicate over local host.
 
-### Kubernetes
-
-Run `vault-init` in the same Pod as the Vault container. See the [vault statefulset](statefulset.yaml) for a complete example.
+See the [example Terraform project](example/) for a complete example including required IAM policies.
 
 ## Configuration
 
 The vault-init service supports the following environment variables for configuration:
 
-* `CHECK_INTERVAL` - The time in seconds between Vault health checks. (300)
-* `S3_BUCKET_NAME` - The Amazon S3 Bucket where the vault master key and root token is stored.
-* `KMS_KEY_ID` - The Amazon KMS key ID used to encrypt and decrypt the vault master key and root token.
-* `VAULT_ADDR` - The vault API address.
+- `LOG_LEVEL`: application log level. Set to -4 to see debug messages.
+- `SECRETSMANAGER_SECRET_ID`: AWS Secrets Manager secret ARN to store information. It must exist, the application does not create it automatically.
+- `CHECK_INTERVAL`: interval between status check requests to Vault (with [units](https://pkg.go.dev/time#ParseDuration)). Defaults to `10s`.
+- `VAULT_SECRET_SHARES`: vault secret shares for initialization, defaults to 5. 
+- `VAULT_SECRET_THRESHOLD`: vault secret threshold for unsealing, defaults to 3. 
+- `RAFT_LEADER_API_ADDR`: URL of the Vault leader to bootstrap Raft followers (e.g. `http://vault-0.vault.svc`).
+- `RAFT_LEADER_CA_CERT`: Raft leader CA cert if TLS is used. To read from a file, use the format `@<file-path>`.
+- `RAFT_LEADER_CLIENT_CERT`: Raft leader client cert if TLS is used. To read from a file, use the format `@<file-path>`.
+- `RAFT_LEADER_CLIENT_KEY`: Raft leader client key if TLS is used. To read from a file, use the format `@<file-path>`.
 
-### Example Values
+The AWS SDK client can be configured using environment variables. See:
+- https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk
+- https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/config#EnvConfig
 
-```
-CHECK_INTERVAL="300"
-S3_BUCKET_NAME="vault-storage"
-KMS_KEY_ID="arn:aws:kms:us-east-1:1234567819:key/dead-beef-dead-beef-deadbeefdead"
-VAULT_ADDR="https://vault.service.consul:8200"
-```
-
-### AWS
-
-The `vault-init` service needs the following set of resources:
-
-- S3 Bucket
-- IAM Role + Instance Profile
-- KMS Key
-
-Here's a minimal example which creates an instance profile that can use a KMS key and read/write to a private S3 bucket.
-
-```hcl
-resource "aws_iam_role" "vault" {
-  assume_role_policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": "sts:AssumeRole",
-      "Principal": {"Service": "ec2.amazonaws.com"},
-      "Effect": "Allow"
-    }
-  ]
-}
-EOF
-}
-
-# use the current caller's ARN as the KMS key administrator
-data "aws_caller_identity" "current" {}
-
-resource "aws_kms_key" "vault" {
-  policy      = <<EOF
-{
-  "Version": "2012-10-17",
-  "Id": "vault-key-policy",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"AWS": "${data.aws_caller_identity.current.arn}"},
-      "Action": "kms:*",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Principal": {"AWS": "${aws_iam_role.vault.arn}"},
-      "Action": [
-	"kms:Encrypt",
-	"kms:Decrypt",
-	"kms:ReEncrypt*",
-	"kms:GenerateDataKey*",
-	"kms:DescribeKey"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-EOF
-}
-
-resource "aws_kms_alias" "vault" {
-  name          = "alias/my-vault-key"
-  target_key_id = "${aws_kms_key.vault.key_id}"
-}
-
-resource "aws_s3_bucket" "vault" {
-  acl = "private"
-}
-
-resource "aws_iam_role_policy" "vault" {
-  role	 = "${aws_iam_role.vault.id}"
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": [
-	"kms:ReEncrypt*",
-	"kms:GenerateDataKey*",
-	"kms:Encrypt",
-	"kms:DescribeKey",
-	"kms:Decrypt"
-      ],
-      "Effect": "Allow",
-      "Resource": "${aws_kms_alias.vault.arn}"
-    },
-    {
-      "Action": "s3:ListBucket",
-      "Effect": "Allow",
-      "Resource": "${aws_s3_bucket.vault.arn}"
-    },
-    {
-      "Action": ["s3:GetObject", "s3:PutObject"],
-      "Effect": "Allow",
-      "Resource": "${aws_s3_bucket.vault.arn}/*"
-    }
-  ]
-}
-EOF
-}
-
-resource "aws_iam_instance_profile" "vault" {
-  role = "${aws_iam_role.vault.name}"
-}
-```
+The HashiCorp Vault API client can be configured using environment variables. See:
+- https://developer.hashicorp.com/vault/docs/commands#environment-variables
+- https://pkg.go.dev/github.com/hashicorp/vault/api#Config.ReadEnvironment

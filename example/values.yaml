@@ -1,0 +1,21 @@
+server:
+  ha:
+    enabled: true
+    raft:
+      enabled: true
+
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: '${role_arn}'
+  
+  extraContainers:
+  - name: vault-init
+    image: '${image}'
+    imagePullPolicy: Always
+    env:
+    - name: SECRETSMANAGER_SECRET_ID
+      value: '${secretsmanager_secret_id}'
+    - name: RAFT_LEADER_API_ADDR
+      value: http://vault-0.vault-internal:8200
+    - name: VAULT_ADDR
+      value: http://localhost:8200
