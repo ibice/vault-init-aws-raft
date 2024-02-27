@@ -7,14 +7,16 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hashicorp/vault/api"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -22,77 +24,118 @@ import (
 
 var (
 	secretsManagerSecretID string
-	client                 *api.Client
+	vaultClient            *api.Client
+	secretsManagerClient   *secretsmanager.Client
 )
 
 func init() {
+	// Viper configuration
 	viper.AutomaticEnv()
-
 	viper.SetDefault("check_interval", 10*time.Second)
 	viper.SetDefault("vault_secret_shares", 5)
 	viper.SetDefault("vault_secret_threshold", 3)
 	viper.SetDefault("log_level", slog.LevelInfo)
 
+	// Logging configuration
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.Level(viper.GetInt("log_level")),
 	})))
-}
 
-func main() {
-	slog.Info("Starting up...")
-
+	// Read required environment variables
 	secretsManagerSecretID = viper.GetString("secretsmanager_secret_id")
 	if secretsManagerSecretID == "" {
 		log.Fatal("SECRETSMANAGER_SECRET_ID env is required")
 	}
+}
 
-	ctx := context.Background()
+func main() {
+	var (
+		ctx = context.Background()
+		err error
+	)
 
-	checkIAMPermissionsForSecret(ctx)
+	slog.Info("Starting up...")
 
-	var err error
-	client, err = newVaultAPIClient()
+	slog.Debug("Creating AWS Secrets Manager client...")
+	secretsManagerClient, err = newAWSSecretManagerClient(ctx)
 	if err != nil {
-		log.Fatalf("Create vault API client: %v", err)
+		log.Fatalf("Create AWS Secret Manager client: %v", err)
 	}
 
+	slog.Debug("Creating HashiCorp Vault cient...")
+	vaultClient, err = newHashiCorpVaultClient()
+	if err != nil {
+		log.Fatalf("Create HashiCorp Vault client: %v", err)
+	}
+
+	slog.Debug("Starting Vault check routine...")
 	ticker := time.NewTicker(viper.GetDuration("check_interval"))
 
 	if err := checkVaultStatus(ctx); err != nil {
-		slog.Error("Checking vault for the first time", "error", err)
+		slog.Error("Checking Vault for the first time", "error", err)
 	}
 
 	for {
 		slog.Debug("Tick", "time", <-ticker.C)
 		if err := checkVaultStatus(ctx); err != nil {
-			slog.Error("Checking vault", "error", err)
+			slog.Error("Checking Vault", "error", err)
 		}
 	}
 }
 
-func checkIAMPermissionsForSecret(ctx context.Context) {
-	var (
-		sm           = secretsmanager.New(session.Must(session.NewSession()))
-		secretString = fmt.Sprintf("%d", time.Now().UnixNano())
-	)
-
-	_, err := sm.UpdateSecretWithContext(ctx, &secretsmanager.UpdateSecretInput{
-		SecretId:     &secretsManagerSecretID,
-		SecretString: &secretString,
-	})
+// Create SDK client for AWS Secrets Manager service and check we have access to get and modify the secret.
+// The SDK client can be configured using environment variables. See:
+// - https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk
+// - https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/config#EnvConfig
+func newAWSSecretManagerClient(ctx context.Context) (*secretsmanager.Client, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		log.Fatalf("Update secret with id %q: %v", secretsManagerSecretID, err)
+		return nil, errors.Wrap(err, "load SDK config")
 	}
 
-	_, err = sm.GetSecretValueWithContext(ctx, &secretsmanager.GetSecretValueInput{
+	var (
+		iamClient            = iam.NewFromConfig(cfg)
+		stsClient            = sts.NewFromConfig(cfg)
+		secretsManagerClient = secretsmanager.NewFromConfig(cfg)
+	)
+
+	slog.Debug("Making sure we can get and update the secret value")
+
+	secret, err := secretsManagerClient.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
 		SecretId: &secretsManagerSecretID,
 	})
 	if err != nil {
-		log.Fatalf("Get secret with id %q: %v", secretsManagerSecretID, err)
+		return nil, errors.Wrap(err, "get AWS secret")
 	}
+
+	callerIdentity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return nil, errors.Wrap(err, "get caller identity")
+	}
+
+	simulation, err := iamClient.SimulatePrincipalPolicy(ctx, &iam.SimulatePrincipalPolicyInput{
+		PolicySourceArn: callerIdentity.Arn,
+		ActionNames:     []string{"secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"},
+		ResourceArns:    []string{*secret.ARN},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "simulate principal policy")
+	}
+
+	for _, result := range simulation.EvaluationResults {
+		if result.EvalDecision != types.PolicyEvaluationDecisionTypeAllowed {
+			return nil, errors.Errorf("policy simulation failed: %+v", result)
+		}
+	}
+
+	return secretsManagerClient, nil
 }
 
-func newVaultAPIClient() (*api.Client, error) {
+// Create API client for HashiCorp Vault.
+// The HashiCorp Vault API client can be configured using environment variables. See:
+// - https://developer.hashicorp.com/vault/docs/commands#environment-variables
+// - https://pkg.go.dev/github.com/hashicorp/vault/api#Config.ReadEnvironment
+func newHashiCorpVaultClient() (*api.Client, error) {
 	config := api.DefaultConfig()
 
 	if err := config.ReadEnvironment(); err != nil {
@@ -107,10 +150,11 @@ func newVaultAPIClient() (*api.Client, error) {
 	return client, nil
 }
 
+// Check vault health status and initialize, join Raft cluster and unseal as needed.
 func checkVaultStatus(ctx context.Context) error {
 	slog.Debug("Checking vault status")
 
-	healthResponse, err := client.Sys().Health()
+	healthResponse, err := vaultClient.Sys().Health()
 	if err != nil {
 		return errors.Wrap(err, "read health")
 	}
@@ -122,8 +166,6 @@ func checkVaultStatus(ctx context.Context) error {
 		return nil
 	}
 
-	sm := secretsmanager.New(session.Must(session.NewSession()))
-
 	if !healthResponse.Initialized {
 		var (
 			hostname = os.Getenv("HOSTNAME")
@@ -134,7 +176,7 @@ func checkVaultStatus(ctx context.Context) error {
 
 		switch replica {
 		case 0:
-			err = initialize(ctx, sm)
+			err = initialize(ctx)
 			if err != nil {
 				return errors.Wrap(err, "initialize")
 			}
@@ -148,7 +190,7 @@ func checkVaultStatus(ctx context.Context) error {
 	}
 
 	if healthResponse.Sealed {
-		err = unseal(ctx, sm)
+		err = unseal(ctx)
 		if err != nil {
 			return errors.Wrap(err, "unseal")
 		}
@@ -157,10 +199,13 @@ func checkVaultStatus(ctx context.Context) error {
 	return nil
 }
 
-func initialize(ctx context.Context, sm *secretsmanager.SecretsManager) error {
+// Initialize vault server and save generated keys in AWS Secrets Manager secret.
+// The initialization process is just executed for the first replica of the statefulset,
+// where the hostname ends with a 0.
+func initialize(ctx context.Context) error {
 	slog.Info("Initializing vault server...")
 
-	initResponse, err := client.Sys().InitWithContext(ctx, &api.InitRequest{
+	initResponse, err := vaultClient.Sys().InitWithContext(ctx, &api.InitRequest{
 		SecretShares:    viper.GetInt("vault_secret_shares"),
 		SecretThreshold: viper.GetInt("vault_secret_threshold"),
 	})
@@ -178,7 +223,7 @@ func initialize(ctx context.Context, sm *secretsmanager.SecretsManager) error {
 	secretString := string(data)
 
 	for {
-		output, err := sm.UpdateSecretWithContext(ctx, &secretsmanager.UpdateSecretInput{
+		output, err := secretsManagerClient.UpdateSecret(ctx, &secretsmanager.UpdateSecretInput{
 			SecretId:     &secretsManagerSecretID,
 			SecretString: &secretString,
 		})
@@ -194,6 +239,7 @@ func initialize(ctx context.Context, sm *secretsmanager.SecretsManager) error {
 	return nil
 }
 
+// Join Raft cluster contacting leader, used to bootstrap follower replicas.
 func joinRaftCluster(ctx context.Context) error {
 	slog.Info("Joining RAFT cluster...")
 
@@ -204,7 +250,7 @@ func joinRaftCluster(ctx context.Context) error {
 		LeaderClientKey:  parseEnvFile(viper.GetString("raft_leader_client_key")),
 	}
 
-	res, err := client.Sys().RaftJoinWithContext(ctx, &opts)
+	res, err := vaultClient.Sys().RaftJoinWithContext(ctx, &opts)
 	if err != nil {
 		return err
 	}
@@ -216,10 +262,11 @@ func joinRaftCluster(ctx context.Context) error {
 	return nil
 }
 
-func unseal(ctx context.Context, sm *secretsmanager.SecretsManager) error {
+// Fetch unseal keys from AWS Secrets Manager secret and unseal Vault server.
+func unseal(ctx context.Context) error {
 	slog.Info("Fetching unseal keys...", "secretID", secretsManagerSecretID)
 
-	secret, err := sm.GetSecretValueWithContext(ctx, &secretsmanager.GetSecretValueInput{
+	secret, err := secretsManagerClient.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: &secretsManagerSecretID,
 	})
 	if err != nil {
@@ -236,7 +283,7 @@ func unseal(ctx context.Context, sm *secretsmanager.SecretsManager) error {
 	slog.Info("Unseal keys received, unsealing vault server...")
 
 	for i, key := range initResponse.KeysB64 {
-		status, err := client.Sys().UnsealWithContext(ctx, key)
+		status, err := vaultClient.Sys().UnsealWithContext(ctx, key)
 		if err != nil {
 			return errors.Wrapf(err, "unseal shard %d", i)
 		}
@@ -250,6 +297,7 @@ func unseal(ctx context.Context, sm *secretsmanager.SecretsManager) error {
 	return nil
 }
 
+// Returns file contents if raw string is in format `@<file-path>`.
 func parseEnvFile(raw string) string {
 	if len(raw) == 0 || raw[0] != '@' {
 		return raw
