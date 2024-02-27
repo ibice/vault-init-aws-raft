@@ -12,11 +12,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
-	"github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hashicorp/vault/api"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -62,6 +60,11 @@ func main() {
 		log.Fatalf("Create AWS Secret Manager client: %v", err)
 	}
 
+	slog.Debug("Checking the secret exists", "secretID", secretsManagerSecretID)
+	if err = checkSecretExistence(ctx); err != nil {
+		log.Fatalf("Checking secret existence: %v", err)
+	}
+
 	slog.Debug("Creating HashiCorp Vault cient...")
 	vaultClient, err = newHashiCorpVaultClient()
 	if err != nil {
@@ -83,7 +86,7 @@ func main() {
 	}
 }
 
-// Create SDK client for AWS Secrets Manager service and check we have access to get and modify the secret.
+// Create SDK client for AWS Secrets Manager service.
 // The SDK client can be configured using environment variables. See:
 // - https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk
 // - https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/config#EnvConfig
@@ -93,42 +96,7 @@ func newAWSSecretManagerClient(ctx context.Context) (*secretsmanager.Client, err
 		return nil, errors.Wrap(err, "load SDK config")
 	}
 
-	var (
-		iamClient            = iam.NewFromConfig(cfg)
-		stsClient            = sts.NewFromConfig(cfg)
-		secretsManagerClient = secretsmanager.NewFromConfig(cfg)
-	)
-
-	slog.Debug("Making sure we can get and update the secret value")
-
-	secret, err := secretsManagerClient.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
-		SecretId: &secretsManagerSecretID,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "get AWS secret")
-	}
-
-	callerIdentity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return nil, errors.Wrap(err, "get caller identity")
-	}
-
-	simulation, err := iamClient.SimulatePrincipalPolicy(ctx, &iam.SimulatePrincipalPolicyInput{
-		PolicySourceArn: callerIdentity.Arn,
-		ActionNames:     []string{"secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"},
-		ResourceArns:    []string{*secret.ARN},
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "simulate principal policy")
-	}
-
-	for _, result := range simulation.EvaluationResults {
-		if result.EvalDecision != types.PolicyEvaluationDecisionTypeAllowed {
-			return nil, errors.Errorf("policy simulation failed: %+v", result)
-		}
-	}
-
-	return secretsManagerClient, nil
+	return secretsmanager.NewFromConfig(cfg), nil
 }
 
 // Create API client for HashiCorp Vault.
@@ -148,6 +116,18 @@ func newHashiCorpVaultClient() (*api.Client, error) {
 	}
 
 	return client, nil
+}
+
+func checkSecretExistence(ctx context.Context) error {
+	secret, err := secretsManagerClient.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
+		SecretId: &secretsManagerSecretID,
+	})
+	if err != nil {
+		return errors.Wrap(err, "describe secret")
+	}
+
+	slog.Debug("Secret exists", "arn", aws.ToString(secret.ARN))
+	return nil
 }
 
 // Check vault health status and initialize, join Raft cluster and unseal as needed.
