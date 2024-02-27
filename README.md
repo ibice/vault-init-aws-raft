@@ -17,15 +17,17 @@ See the [example Terraform project](example/) for a complete example including r
 
 The vault-init service supports the following environment variables for configuration:
 
-- `LOG_LEVEL`: application log level. Set to -4 to see debug messages.
-- `SECRETSMANAGER_SECRET_ID`: AWS Secrets Manager secret ARN to store information. It must exist, the application does not create it automatically.
-- `CHECK_INTERVAL`: interval between status check requests to Vault (with [units](https://pkg.go.dev/time#ParseDuration)). Defaults to `10s`.
-- `VAULT_SECRET_SHARES`: vault secret shares for initialization, defaults to 5. 
-- `VAULT_SECRET_THRESHOLD`: vault secret threshold for unsealing, defaults to 3. 
-- `RAFT_LEADER_API_ADDR`: URL of the Vault leader to bootstrap Raft followers (e.g. `http://vault-0.vault.svc`).
-- `RAFT_LEADER_CA_CERT`: Raft leader CA cert if TLS is used. To read from a file, use the format `@<file-path>`.
-- `RAFT_LEADER_CLIENT_CERT`: Raft leader client cert if TLS is used. To read from a file, use the format `@<file-path>`.
-- `RAFT_LEADER_CLIENT_KEY`: Raft leader client key if TLS is used. To read from a file, use the format `@<file-path>`.
+| Env                        | Description                                                                                                               |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`                | Application log level. Set to -4 to see debug messages.                                                                   |
+| `SECRETSMANAGER_SECRET_ID` | AWS Secrets Manager secret ARN to store information. It must exist, the application does not create it automatically.     |
+| `CHECK_INTERVAL`           | Interval between status check requests to Vault (with [units](https://pkg.go.dev/time#ParseDuration)). Defaults to `10s`. |
+| `VAULT_SECRET_SHARES`      | Vault secret shares for initialization, defaults to 5.                                                                    |
+| `VAULT_SECRET_THRESHOLD`   | Vault secret threshold for unsealing, defaults to 3.                                                                      |
+| `RAFT_LEADER_API_ADDR`     | URL of the Vault leader to bootstrap Raft followers (e.g. `http://vault-0.vault.svc`).                                    |
+| `RAFT_LEADER_CA_CERT`      | Raft leader CA cert if TLS is used. To read from a file, use the format `@<file-path>`.                                   |
+| `RAFT_LEADER_CLIENT_CERT`  | Raft leader client cert if TLS is used. To read from a file, use the format `@<file-path>`.                               |
+| `RAFT_LEADER_CLIENT_KEY`   | Raft leader client key if TLS is used. To read from a file, use the format `@<file-path>`.                                |
 
 The AWS SDK client can be configured using environment variables. See:
 - https://aws.github.io/aws-sdk-go-v2/docs/configuring-sdk
